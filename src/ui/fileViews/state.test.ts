@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import type { ExtensionDiffFile } from "../../extension-api/types";
 import type { RegisteredFileView } from "../../extensions/types";
 import {
+  bumpFileViewEpoch,
+  fileViewLayoutEpoch,
+  reconcileFileViewEpochs,
   reconcileFileViewSelections,
   registeredFileViewKey,
   resolveBulkFileViewTarget,
@@ -89,6 +92,65 @@ describe("file-view selection state", () => {
     });
     expect(selectFileViewForFiles(selected, ["first", "second"], "preview:new")).toBe(selected);
     expect(selectFileViewForFiles(current, [], "preview:new")).toBe(current);
+  });
+
+  test("counts refreshes per view from an implicit zero and always changes map identity", () => {
+    const first = bumpFileViewEpoch(new Map(), "preview:rendered");
+    expect([...first]).toEqual([["preview:rendered", 1]]);
+
+    const second = bumpFileViewEpoch(first, "preview:rendered");
+    expect(second).not.toBe(first);
+    expect(second.get("preview:rendered")).toBe(2);
+    // One view's invalidation never disturbs another's prepared layouts.
+    expect(bumpFileViewEpoch(second, "other:view").get("preview:rendered")).toBe(2);
+  });
+
+  test("scopes a refresh to one file without disturbing the view's other presentations", () => {
+    const viewWide = bumpFileViewEpoch(new Map(), "preview:rendered");
+    const scoped = bumpFileViewEpoch(viewWide, "preview:rendered", "readme");
+
+    expect(fileViewLayoutEpoch(scoped, "preview:rendered", "readme")).toBe(2);
+    // The other file presenting the same view keeps the epoch its prepared layout is retained under.
+    expect(fileViewLayoutEpoch(scoped, "preview:rendered", "other")).toBe(
+      fileViewLayoutEpoch(viewWide, "preview:rendered", "other"),
+    );
+    // Either kind of bump always moves the composed epoch, whichever order they arrive in.
+    expect(
+      fileViewLayoutEpoch(
+        bumpFileViewEpoch(scoped, "preview:rendered"),
+        "preview:rendered",
+        "other",
+      ),
+    ).toBe(2);
+    expect(fileViewLayoutEpoch(new Map(), "preview:rendered", "readme")).toBe(0);
+  });
+
+  test("drops epochs for views and files a reload removed while preserving identity otherwise", () => {
+    const current = bumpFileViewEpoch(
+      bumpFileViewEpoch(
+        bumpFileViewEpoch(bumpFileViewEpoch(new Map(), "preview:rendered"), "gone:view"),
+        "preview:rendered",
+        "readme",
+      ),
+      "preview:rendered",
+      "deleted",
+    );
+    const kept = reconcileFileViewEpochs(current, ["readme"], new Set(["preview:rendered"]));
+
+    expect(fileViewLayoutEpoch(kept, "preview:rendered", "readme")).toBe(2);
+    // A scoped entry outlives neither its view nor the file it names.
+    expect(fileViewLayoutEpoch(kept, "preview:rendered", "deleted")).toBe(1);
+    expect(fileViewLayoutEpoch(kept, "gone:view", "readme")).toBe(0);
+
+    expect(
+      reconcileFileViewEpochs(
+        current,
+        ["readme", "deleted"],
+        new Set(["preview:rendered", "gone:view"]),
+      ),
+    ).toBe(current);
+    const empty = new Map<string, number>();
+    expect(reconcileFileViewEpochs(empty, [], new Set())).toBe(empty);
   });
 
   test("allows an extension view id named raw because only null is the raw sentinel", () => {

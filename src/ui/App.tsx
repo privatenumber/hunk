@@ -76,12 +76,15 @@ import { useFileViewLayouts } from "./fileViews/useFileViews";
 import type { FileViewRowFailure } from "./components/panes/FileView";
 import { availableFileViewSelections, fileViewUnavailableReason } from "./fileViews/availability";
 import {
+  bumpFileViewEpoch,
+  reconcileFileViewEpochs,
   reconcileFileViewSelections,
   registeredFileViewKey,
   resolveBulkFileViewTarget,
   resolveRegisteredFileView,
   selectFileView,
   selectFileViewForFiles,
+  type FileViewEpochState,
 } from "./fileViews/state";
 import { createExtensionSidebarKeybindings, resolveCommandKeys } from "./lib/keymap";
 import {
@@ -351,6 +354,11 @@ export function App({
     [extensions],
   );
   const [fileViewSelections, setFileViewSelections] = useState<Record<string, string>>({});
+  // Layout invalidation an extension asked for. Session-scoped on purpose: a reload replaces every
+  // registration object, which already invalidates prepared layouts on its own.
+  const [fileViewEpochs, setFileViewEpochs] = useState<FileViewEpochState>(
+    () => new Map<string, number>(),
+  );
   const fileViewSelectionsRef = useRef(fileViewSelections);
   fileViewSelectionsRef.current = fileViewSelections;
   const sessionFileViewsRef = useRef(sessionFileViews);
@@ -371,16 +379,18 @@ export function App({
     () => availableFileViewSelections(fileViewSelections, fileViewUnavailableReasons),
     [fileViewSelections, fileViewUnavailableReasons],
   );
+  // Every reviewed file id, filtering included: hiding a file does not un-review it, so
+  // reconciliation and scoped-refresh validation both judge ids against the whole review from
+  // this one derivation rather than the visible subset.
+  const reviewFileIds = useMemo(() => new Set(reviewFiles.map((file) => file.id)), [reviewFiles]);
+  const reviewFileIdsRef = useRef(reviewFileIds);
+  reviewFileIdsRef.current = reviewFileIds;
   useEffect(() => {
     const viewKeys = new Set(sessionFileViews.map(registeredFileViewKey));
-    setFileViewSelections((current) =>
-      reconcileFileViewSelections(
-        current,
-        reviewFiles.map((file) => file.id),
-        viewKeys,
-      ),
-    );
-  }, [reviewFiles, sessionFileViews]);
+    const fileIds = [...reviewFileIds];
+    setFileViewSelections((current) => reconcileFileViewSelections(current, fileIds, viewKeys));
+    setFileViewEpochs((current) => reconcileFileViewEpochs(current, fileIds, viewKeys));
+  }, [reviewFileIds, sessionFileViews]);
   // The one conversion of the visible review files into the frozen views every
   // extension surface sees: sidebar props and command-handler selection both
   // read from this list, so they can never describe the review differently.
@@ -644,6 +654,25 @@ export function App({
             !fileViewUnavailableReasonsRef.current.has(fileId) &&
             registered &&
             fileViewSelectionsRef.current[fileId] === registeredFileViewKey(registered),
+          );
+        },
+        refresh(viewId: string, options?: { fileId?: string }) {
+          const registered = resolve(viewId);
+          if (!registered) {
+            showSessionNotice(`Extension ${extensionId} targeted unknown file view "${viewId}"`);
+            return;
+          }
+          // View-wide by default: a stateful view's state is usually the view's, and every file
+          // presenting it is showing geometry derived from it. A `fileId` narrows the invalidation
+          // to the one file whose state changed. Like other affordance-adjacent reads, a malformed
+          // option is ignored rather than thrown at the caller.
+          const fileId = typeof options?.fileId === "string" ? options.fileId : undefined;
+          // An id no reviewed file carries — a stale id racing a reload — invalidates nothing, so
+          // storing its epoch would only leave an inert entry behind until the next reconcile.
+          // Silently, per the contract: a raced id is not a caller mistake worth a warning.
+          if (fileId !== undefined && !reviewFileIdsRef.current.has(fileId)) return;
+          setFileViewEpochs((current) =>
+            bumpFileViewEpoch(current, registeredFileViewKey(registered), fileId),
           );
         },
       };
@@ -956,6 +985,7 @@ export function App({
     selections: availableFileViewSelectionState,
     views: sessionFileViews,
     width: diffContentWidth,
+    epochs: fileViewEpochs,
     onIssue: showSessionNotice,
   });
   useEffect(() => {

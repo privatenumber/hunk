@@ -21,6 +21,92 @@ export function resolveRegisteredFileView(
   return views.find((view) => registeredFileViewKey(view) === key);
 }
 
+/**
+ * Layout invalidation counters for one session, in two kinds of key.
+ *
+ * A bare `registeredFileViewKey` counts view-wide invalidation; a
+ * `fileViewFileEpochKey` counts invalidation scoped to one reviewed file's
+ * presentation of that view. One map holds both so preparation has a single
+ * place to consult, and `fileViewLayoutEpoch` is the only thing that knows how
+ * the two compose.
+ *
+ * Absent means zero: a view only earns an entry once something invalidates it,
+ * so the common session never carries any epoch state at all.
+ */
+export type FileViewEpochState = ReadonlyMap<string, number>;
+
+/**
+ * Separator joining a view key and a file id into one scoped epoch key.
+ *
+ * NUL is the one character neither side can carry: view keys are built from
+ * registered ids, and file ids come from repository paths, which no supported
+ * filesystem lets contain a NUL. So a scoped key can never be read as a
+ * view-wide key, and no two (view, file) pairs can collapse onto one key.
+ */
+const FILE_VIEW_FILE_EPOCH_SEPARATOR = "\u0000";
+
+/** Key the epoch that invalidates only one file's prepared layout of one view. */
+function fileViewFileEpochKey(viewKey: string, fileId: string) {
+  return `${viewKey}${FILE_VIEW_FILE_EPOCH_SEPARATOR}${fileId}`;
+}
+
+/**
+ * The invalidation epoch one `(file, view)` preparation is retained under.
+ *
+ * View-wide and file-scoped counters are summed rather than compared, so
+ * bumping either always moves the result and neither can mask the other
+ * whatever order they arrive in. Both only ever count up.
+ */
+export function fileViewLayoutEpoch(epochs: FileViewEpochState, viewKey: string, fileId: string) {
+  return (epochs.get(viewKey) ?? 0) + (epochs.get(fileViewFileEpochKey(viewKey, fileId)) ?? 0);
+}
+
+/**
+ * Invalidate prepared layouts by bumping one epoch.
+ *
+ * Without `fileId` this retires every prepared layout of the view; with one it
+ * retires only that file's, leaving the other presenting files untouched.
+ */
+export function bumpFileViewEpoch(
+  current: FileViewEpochState,
+  viewKey: string,
+  fileId?: string,
+): FileViewEpochState {
+  const key = fileId === undefined ? viewKey : fileViewFileEpochKey(viewKey, fileId);
+  // A fresh map identity is the signal preparation watches; mutating in place would be invisible.
+  const next = new Map(current);
+  next.set(key, (current.get(key) ?? 0) + 1);
+  return next;
+}
+
+/**
+ * Drop epochs a reload orphaned, keeping map identity when nothing changed.
+ *
+ * A scoped entry outlives neither its view nor the file it names: a reload that
+ * drops either retires the entry with it.
+ */
+export function reconcileFileViewEpochs(
+  current: FileViewEpochState,
+  fileIds: readonly string[],
+  viewKeys: ReadonlySet<string>,
+): FileViewEpochState {
+  if (current.size === 0) return current;
+  const validFileIds = new Set(fileIds);
+  const next = new Map<string, number>();
+  for (const [key, epoch] of current) {
+    const separator = key.indexOf(FILE_VIEW_FILE_EPOCH_SEPARATOR);
+    if (separator === -1) {
+      if (viewKeys.has(key)) next.set(key, epoch);
+    } else if (
+      viewKeys.has(key.slice(0, separator)) &&
+      validFileIds.has(key.slice(separator + FILE_VIEW_FILE_EPOCH_SEPARATOR.length))
+    ) {
+      next.set(key, epoch);
+    }
+  }
+  return next.size === current.size ? current : next;
+}
+
 /** Reconcile per-file selections after filtering/reload removes files or views. */
 export function reconcileFileViewSelections(
   current: FileViewSelectionState,
