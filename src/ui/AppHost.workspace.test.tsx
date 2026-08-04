@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -44,6 +44,29 @@ function createTestRepo(prefix: string) {
   execSync("git add . && git commit -m init", { cwd: repo, stdio: "ignore" });
   writeFileSync(join(repo, "alpha.txt"), "one\ntwo\n");
   return repo;
+}
+
+/**
+ * Create a Git checkout whose only reviewed change is a symlink pointing at a
+ * file outside it. Git treats a link to a file as an ordinary reviewable entry,
+ * so this is a changeset a real review can hand `ctx.workspace` — and the one
+ * shape where a repo-relative path and the bytes a write would replace are not
+ * in the same repository.
+ */
+function createTestRepoLinkingOutside(prefix: string) {
+  const repo = createTempDir(prefix);
+  execSync("git init && git config user.email test@test && git config user.name test", {
+    cwd: repo,
+    stdio: "ignore",
+  });
+  writeFileSync(join(repo, "alpha.txt"), "one\n");
+  execSync("git add . && git commit -m init", { cwd: repo, stdio: "ignore" });
+
+  const outside = createTempDir(`${prefix}outside-`);
+  const secret = join(outside, "secret.txt");
+  writeFileSync(secret, "secret\n");
+  symlinkSync(secret, join(repo, "linked.txt"));
+  return { repo, secret };
 }
 
 function readProbeLog(logPath: string) {
@@ -438,6 +461,51 @@ describe("extension workspace writes", () => {
       expect(readFileSync(join(repo, "alpha.txt"), "utf8")).toBe("one\ntwo\n");
     });
   });
+
+  // Creating symlinks needs Developer Mode or elevation on Windows; the refusal
+  // itself is portable, only this fixture is not.
+  test.skipIf(process.platform === "win32")(
+    "a reviewed symlink refuses the write without asking the user",
+    async () => {
+      const { repo, secret } = createTestRepoLinkingOutside("hunk-ext-write-symlink-");
+      const extDir = createTempDir("hunk-ext-write-symlink-ext-");
+      const logPath = join(extDir, "probe.log");
+      const extPath = join(extDir, "ext.ts");
+      writeWorkspaceFixture(extPath, logPath);
+
+      const bootstrap = await launchWithExtension(repo, extPath, {
+        kind: "vcs",
+        staged: false,
+        options: { mode: "stack", extensionPaths: [extPath] },
+      });
+      await withAppHost(bootstrap, async (setup) => {
+        await flushUntil(
+          setup,
+          () => setup.captureCharFrame().includes("linked.txt"),
+          "the review to render",
+        );
+
+        await act(async () => {
+          await setup.mockInput.typeText("y");
+        });
+        await flushUntil(
+          setup,
+          () => readProbeLog(logPath).some((line) => line.includes('"reason":"unavailable"')),
+          "the handler to resolve an unavailable write",
+        );
+
+        const log = readProbeLog(logPath);
+        expect(log.join("\n")).toContain("is a symlink");
+        // The probe skips the filesystem and says yes; the write is the half
+        // that looks, and it refuses before anyone is asked to consent to a
+        // prompt that would have named only `linked.txt`.
+        expect(log).toContain("can true");
+        expect(setup.captureCharFrame()).not.toContain("Write linked.txt?");
+        // Nothing followed the link out of the repository.
+        expect(readFileSync(secret, "utf8")).toBe("secret\n");
+      });
+    },
+  );
 
   test("a revision review refuses the write without asking the user", async () => {
     const repo = createTestRepo("hunk-ext-write-show-");
