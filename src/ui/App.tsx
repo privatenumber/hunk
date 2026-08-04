@@ -233,6 +233,13 @@ export function App({
     () => resolveExperimentalDiffFiles(bootstrap.changeset.files, bootstrap.input.options),
     [bootstrap.changeset.files, bootstrap.input.options.experimental],
   );
+  // The live bootstrap, mirrored eagerly the way every other prop-derived input
+  // here is. A soft reload replaces it under a mounted App, so work that started
+  // before the swap and resumes after it — an extension command handler that
+  // awaited a dialog or a read — must be tagged with the review it is actually
+  // acting on rather than the one its closure captured.
+  const bootstrapRef = useRef(bootstrap);
+  bootstrapRef.current = bootstrap;
   const renderer = useRenderer();
   const terminal = useTerminalDimensions();
   const diffScrollRef = useRef<ScrollBoxRenderable | null>(null);
@@ -669,6 +676,16 @@ export function App({
     [],
   );
 
+  /**
+   * Report whether a mode holds the keyboard *right now*.
+   *
+   * Asked rather than told, and answered from the eagerly written ref: OpenTUI
+   * delivers every key of one input chunk synchronously, so a second key can
+   * arrive after the first exited the mode and before React has re-rendered.
+   * A rendered boolean would still say "active" for that key and swallow it.
+   */
+  const isFileViewModeActive = useCallback(() => activeFileViewModeRef.current !== null, []);
+
   /** Hand one key to the active mode; the key hook turns the answer into ownership. */
   const sendFileViewModeKey = useCallback(
     (key: ExtensionKeyEvent): ExtensionFileViewModeKeyResult => {
@@ -687,6 +704,10 @@ export function App({
    * mode's `file` and controls describe the review as it was when the user
    * entered it — the same snapshot semantics a command's `selection` has.
    *
+   * A mode already holding the keyboard is exited first: one session runs one
+   * mode, and the outgoing one is owed its `onExit` even when what replaced it
+   * is another mode rather than a key or a navigation.
+   *
    * Every containment check — the view matching the file, the file being
    * presentable at all — belongs to `resolveFileViewModeActivation`, which the
    * one caller runs first; the selected-file guard survives here only because
@@ -699,6 +720,10 @@ export function App({
         showSessionNotice(`Extension ${callerId} cannot enter a mode without a selected file`);
         return false;
       }
+
+      // Through the one teardown path, so the mode being replaced exits exactly
+      // as it would have on Escape — `onExit` once, before the new `onEnter`.
+      exitFileViewMode();
 
       // The mode's code belongs to whoever registered the view, not to whoever
       // asked for it: one extension may enter another's mode by qualified id,
@@ -719,8 +744,11 @@ export function App({
         mode,
         registered,
         // A reload replaces the bootstrap under a mounted App, which is exactly
-        // when a mode's file snapshot stops describing the review.
-        reviewGeneration: bootstrap,
+        // when a mode's file snapshot stops describing the review. Read live
+        // rather than captured: an async handler resuming after a reload enters
+        // against the current review — the `file` above already comes from it —
+        // so tagging with a captured generation would exit the mode on sight.
+        reviewGeneration: bootstrapRef.current,
         viewId: registered.view.id,
         viewKey: registeredFileViewKey(registered),
       };
@@ -733,7 +761,6 @@ export function App({
       return true;
     },
     [
-      bootstrap,
       exitFileViewMode,
       extensions,
       getExtensionSelection,
@@ -2187,7 +2214,7 @@ export function App({
     moveExtensionDialogSelection,
     extensionTrustPromptOpen,
     trustRepoExtensions,
-    fileViewModeActive: activeFileViewMode !== null,
+    isFileViewModeActive,
     exitFileViewMode,
     sendFileViewModeKey,
     focusArea,
