@@ -5175,7 +5175,6 @@ var init_package = __esm(() => {
     },
     dependencies: {
       "@pierre/diffs": "1.3.5",
-      bun: "^1.3.14",
       chokidar: "^4.0.3",
       commander: "^14.0.3",
       diff: "^8.0.3",
@@ -5197,6 +5196,7 @@ var init_package = __esm(() => {
       "@types/bun": "1.3.14",
       "@types/react": "^19.2.14",
       "@types/ws": "^8.18.1",
+      bun: "^1.3.14",
       "dependency-cruiser": "18.2.0",
       knip: "^6.32.0",
       "lint-staged": "^16.4.0",
